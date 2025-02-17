@@ -1,5 +1,4 @@
-
-/****************************************************************
+****************************************************************
  * server.js
  * - /refresh-token returns JSON (no HTML)
  * - CORS enabled so you can call from any domain
