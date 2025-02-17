@@ -1,5 +1,3 @@
-
-
 <!DOCTYPE HTML>
 <html lang="en">
 <head>
@@ -429,8 +427,8 @@
          * Token Management
          *********************************/
         let currentToken = {
-            value: 'ya29.a0AXeO80TBJ03eXjLQ5U0bGBR39PdpcoZ3_10SZlJMAtS4iYrTEjcPEOOVH_hki3EWjRq6O_dORUjIkJp2pQpurQmj_Enr_2DZMEgiWilw_Uw4hr986uyGA6CBFtqCqPtWlCdp9HcQ9C5tU3JWW5foo4YOIcwvv4vjGgLeeO1iktNYfIPCB-YF55Zp3-cpZab7AdyMbdcHBgC5SQjWgtBUf67Xf4a7yxZgDT6kwjfHg5VhsKI8ZV8R1VL0bXKoJVXhcJ7h9zrFcTyHoX2-zBn5I4N2Ip7u46_mJUEHCXXyPO4Ji5ENrXzqgdd_lgTZRU3q3K15vHeaFuNMVEOoAy6sF3jYpHTJ5G3DuTCaVq7zE09DHBiO1LrKZAYMGiSIyRJYDx9xUsucgnjKrg50mMyHzv_Ivfuy7YYaCgYKAcESARISFQHGX2MiZgf8ApB0GQKSncq7dhMqSA0422',
-            expiresAt: Date.now() + 3600000 // Token expires in 1 hour
+            value: null, // Will be fetched below
+            expiresAt: 0  // Will be updated
         };
 
         async function refreshToken() {
@@ -443,7 +441,7 @@
                 });
                 
                 if (!response.ok) {
-                    throw new Error('Failed to refresh token');
+                    throw new Error(`Failed to refresh token. Status: ${response.status}`);
                 }
 
                 const data = await response.json();
@@ -460,8 +458,8 @@
         }
 
         async function getValidToken() {
-            // Check if current token is expired or will expire in the next 5 minutes
-            if (Date.now() + 300000 >= currentToken.expiresAt) {
+            // If we have < 5min left or no token at all, refresh
+            if (!currentToken.value || (Date.now() + 300000 >= currentToken.expiresAt)) {
                 return await refreshToken();
             }
             return currentToken.value;
@@ -472,8 +470,8 @@
          *********************************/
         document.addEventListener('DOMContentLoaded', async () => {
             try {
-                // Verify token is valid
-                await getValidToken();
+                // Refresh token initially so we have a valid one
+                await refreshToken();
                 
                 // Set all model statuses to ready
                 document.getElementById('hepaticModelStatus').textContent = "Ready for classification";
@@ -483,8 +481,7 @@
                 document.getElementById('renalModelStatus').textContent = "Ready for classification";
                 document.getElementById('renalModelStatus').classList.add('model-ready');
             } catch (error) {
-                console.error('Error initializing:', error);
-                // Update status to show error
+                console.error('Error initializing token:', error);
                 const statuses = ['hepaticModelStatus', 'portalModelStatus', 'renalModelStatus'];
                 statuses.forEach(id => {
                     document.getElementById(id).textContent = "Error: Authentication failed";
@@ -504,9 +501,18 @@
         }
 
         /*************************************************************
-         * Generic classification function
+         * Generic classification function with defensive checks
+         * and 401 handling.
          *************************************************************/
-        async function classifyImage(imgElement, resultId, topResultsId, dropdownId, errorNoteId, labelSet) {
+        async function classifyImage(
+            imgElement, 
+            resultId, 
+            topResultsId, 
+            dropdownId, 
+            errorNoteId, 
+            labelSet, 
+            retryAttempt = false
+        ) {
             try {
                 // Convert image to base64
                 const canvas = document.createElement('canvas');
@@ -519,29 +525,70 @@
                 // Get a valid token
                 const accessToken = await getValidToken();
 
+                // Endpoint for your Vertex AI model (change these to match your project/endpoint)
+                const endpointUrl = 'https://us-central1-aiplatform.googleapis.com/v1/projects/plucky-weaver-450819-k7/locations/us-central1/endpoints/1401033999995895808:predict';
+
                 // Make prediction request
-                const predictionResponse = await fetch(
-                    `https://us-central1-aiplatform.googleapis.com/v1/projects/plucky-weaver-450819-k7/locations/us-central1/endpoints/1401033999995895808:predict`,
-                    {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${accessToken}`
-                        },
-                        body: JSON.stringify({
-                            instances: [
-                                {
-                                    content: base64Image
-                                }
-                            ]
-                        })
-                    }
-                );
+                const predictionResponse = await fetch(endpointUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${accessToken}`
+                    },
+                    body: JSON.stringify({
+                        instances: [
+                            {
+                                content: base64Image
+                            }
+                        ]
+                    })
+                });
+
+                // If unauthorized (401) and not yet retried, attempt refresh token once
+                if (predictionResponse.status === 401 && !retryAttempt) {
+                    console.warn('Received 401 Unauthorized. Attempting token refresh and retry...');
+                    await refreshToken();
+                    return classifyImage(
+                        imgElement,
+                        resultId,
+                        topResultsId,
+                        dropdownId,
+                        errorNoteId,
+                        labelSet,
+                        true
+                    );
+                }
+
+                if (!predictionResponse.ok) {
+                    throw new Error(`Prediction request failed with status ${predictionResponse.status}`);
+                }
 
                 const predictions = await predictionResponse.json();
-                
-                // Process predictions
-                let top3 = predictions.predictions[0].confidences
+                console.log('Raw Vertex AI response:', predictions);
+
+                // Check for top-level error from Vertex AI
+                if (predictions.error) {
+                    throw new Error(predictions.error.message || 'Unknown error from Vertex AI');
+                }
+
+                // Validate that we have predictions and confidences
+                if (
+                    !predictions.predictions ||
+                    !Array.isArray(predictions.predictions) ||
+                    predictions.predictions.length === 0 ||
+                    !predictions.predictions[0].confidences
+                ) {
+                    throw new Error('Unexpected response structure: ' + JSON.stringify(predictions));
+                }
+
+                // Extract the confidences from the first prediction
+                const confidences = predictions.predictions[0].confidences;
+                if (confidences.length !== labelSet.length) {
+                    throw new Error('Mismatch between labelSet and confidences array length.');
+                }
+
+                // Sort top 3
+                let top3 = confidences
                     .map((conf, idx) => ({
                         label: labelSet[idx],
                         prob: (conf * 100).toFixed(1)
@@ -550,6 +597,8 @@
                     .slice(0, 3);
 
                 let top1 = top3[0];
+
+                // Display result
                 document.getElementById(resultId).textContent = 
                     `Top prediction: ${top1.label} (${top1.prob}%)`;
                 
@@ -557,11 +606,11 @@
                     '<strong>Top 3 Predictions:</strong><br>' +
                     top3.map(r => `${r.label}: ${r.prob}%`).join('<br>');
 
+                // Auto-select dropdown if top1.prob > 50
                 const dropdown = document.getElementById(dropdownId);
                 const errorNote = document.getElementById(errorNoteId);
-
                 if (parseFloat(top1.prob) > 50) {
-                    let matchedOption = [...dropdown.options].find(opt => opt.value === top1.label);
+                    const matchedOption = [...dropdown.options].find(opt => opt.value === top1.label);
                     if (matchedOption) {
                         dropdown.value = matchedOption.value;
                     }
@@ -572,8 +621,9 @@
                 }
 
             } catch (err) {
-                console.error("Error during classification:", err);
-                document.getElementById(resultId).textContent = "Error during classification: " + err.message;
+                console.error('Error during classification:', err);
+                document.getElementById(resultId).textContent =
+                    "Error during classification: " + err.message;
             }
         }
 
@@ -644,17 +694,17 @@
          * VExUS Score Calculation
          ********************************************/
         function calculateVexusScore() {
-            // Step #1: IVC <2cm or >2cm
+            // Step 1: IVC from dropdown
             const ivcSelection = document.getElementById('ivcDropdown').value;
             let ivcValue = null; 
             if (ivcSelection === "<2cm") ivcValue = 1.9;
             if (ivcSelection === ">2cm") ivcValue = 2.1;
             
-            // Step #2: Hepatic from dropdown
+            // Step 2: Hepatic from dropdown
             const hvChoice = document.getElementById('hepaticDropdown').value;
-            // Step #3: Portal from dropdown
+            // Step 3: Portal from dropdown
             const pvChoice = document.getElementById('portalDropdown').value;
-            // Step #4: Renal from dropdown
+            // Step 4: Renal from dropdown
             const rvChoice = document.getElementById('renalDropdown').value;
 
             // If IVC wasn't selected, we cannot proceed
